@@ -1,0 +1,17 @@
+ultralytics>=8.2.0
+opencv-python>=4.9.0
+torch>=2.1.0
+torchvision
+torchaudio
+numpy
+scipy
+lap
+cython-bbox
+Pillow
+
+setuptools>=68.0
+wheel>=0.42
+cython>=3.0.10
+
+# força instalação do módulo cython_bbox local
+-e ./app/tracker/bytetrack

@@ -1,0 +1,21 @@
+# Ambiente virtual
+.venv/
+venv/
+ENV/
+env/
+
+# Cache e temporários
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+
+# videos
+data/
+
+# Configurações locais e IDE
+*.env
+.DS_Store
+.idea/
+.vscode/
