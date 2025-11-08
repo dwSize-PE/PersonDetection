@@ -19,3 +19,5 @@ data/
 .DS_Store
 .idea/
 .vscode/
+app/tracker/bytetrack/cython_bbox.c
+app/tracker/bytetrack/cython_bbox.egg-info/
