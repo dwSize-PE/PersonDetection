@@ -11,7 +11,7 @@ import torch.nn as nn
 from torchvision import transforms
 from PIL import Image
 
-from app.osnet_external.osnet import osnet_ibn_x1_0
+from app.osnet_external.osnet import osnet_x1_0
 
 
 class OsNetEmbedder:
@@ -20,7 +20,15 @@ class OsNetEmbedder:
         self.device = self._select_device(device)
         self.half = bool(half and self.device.type == "cuda")
 
-        self.model = osnet_ibn_x1_0(pretrained=False, loss="softmax")
+        num_classes = 1000  # padrão
+        if os.path.exists(weight_path):
+            ckpt = torch.load(weight_path, map_location="cpu", weights_only=False)
+            state_dict = ckpt.get('state_dict', ckpt.get('model', ckpt)) if isinstance(ckpt, dict) else ckpt
+            new_state = {(k[7:] if k.startswith('module.') else k): v for k, v in state_dict.items()}
+            if 'classifier.weight' in new_state:
+                num_classes = new_state['classifier.weight'].shape[0]
+
+        self.model = osnet_x1_0(num_classes=num_classes, pretrained=False, loss="triplet")
         self.model.eval().to(self.device)
         if self.half:
             self.model.half()
@@ -120,7 +128,9 @@ class OsNetEmbedder:
             tensor_3chw = tensor_3chw.half()
         x = tensor_3chw.unsqueeze(0).to(self.device, non_blocking=True)  # (1,3,256,128)
         v = self.model(x)                                                # (1,512)
+        print(f"[OSNET_RAW] norm={torch.norm(v, p=2, dim=1).item():.4f} mean={v.mean().item():.4f}")
         v = torch.nn.functional.normalize(v, p=2, dim=1)
+        print(f"[OSNET_NORM] norm={torch.norm(v, p=2, dim=1).item():.4f} mean={v.mean().item():.4f}")
         return v.detach().float().cpu()[0]  # torch.Tensor (512,)
 
     def _warmup(self):

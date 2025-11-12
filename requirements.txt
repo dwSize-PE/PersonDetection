@@ -14,4 +14,4 @@ wheel>=0.42
 cython>=3.0.10
 
 # força instalação do módulo cython_bbox local
--e ./app/tracker/bytetrack
+#pip install -e ./app/tracker/bytetrack

@@ -71,7 +71,7 @@ def start_stream():
     gallery = Gallery(buffer_size=10)
     
     osnet = OsNetEmbedder(
-        weight_path="models/osnet_ibn_x1_0_imagenet.pth",
+        weight_path="models/best_model.pth",
         device="auto",
         half=False
     )

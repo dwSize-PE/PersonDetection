@@ -566,7 +566,7 @@ class ReIdentifier:
                 best_pid = pid
 
         # valida threshold absoluto mínimo de similaridade
-        if best_pid is None or best_sim < 0.55:
+        if best_pid is None or best_sim < 0.78:
             return None
 
         print(f"{LOG_PREFIX_HUNG} assign: T{track_id}→P{best_pid:02d} cost={best_cost:.2f} sim={best_sim:.2f}")

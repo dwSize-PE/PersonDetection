@@ -281,9 +281,30 @@ class ReIDEmbedderThread:
                 # ============================================================
                 # OSNET EMBEDDING EXTRACTION
                 # ============================================================
+                
+                preview = crop.copy()
+                cv2.putText(preview, "a", (10, 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                cv2.imshow("BBox Preview", preview)
+
+                key = cv2.waitKey(1)
+                if key == 27:  # ESC fecha a janela
+                    cv2.destroyWindow("BBox Preview")
+                    
                 emb = self.osnet.extract_one(crop)
                 if emb is None:
                     continue
+
+                # ============================================================
+                # TEST 1: OSNet cru vs Banco
+                # ============================================================
+                if self.reid.is_promoted(track_id):
+                    pid = self.reid.get_global_id(track_id)
+                    if pid is not None:
+                        identity = self.reid.bank.get(pid)
+                        if identity is not None:
+                            sim_raw = torch.matmul(emb.view(1,-1), identity.embedding.view(1,-1).T).item()
+                            print(f"[TEST_RAW] tid=T{track_id} pid=P{pid:02d} sim_raw={sim_raw:.3f}")
 
                 # ============================================================
                 # BUFFER: adiciona com stride temporal
@@ -301,6 +322,15 @@ class ReIDEmbedderThread:
                 if added:
                     size = self.gallery.count(track_id)
                     print(f"[BUF_ADD] f={frame_index} tid=T{track_id} size={size}/10 scale={scale} blur_z={blur_z:+.1f} stride_ok=YES")
+                    
+                    # ============================================================
+                    # TEST 2: OSNet cru vs Gallery consolidado
+                    # ============================================================
+                    if size >= 2:
+                        emb_cons = self.gallery.get(track_id)
+                        if emb_cons is not None:
+                            sim_cons = torch.matmul(emb.view(1,-1), emb_cons.view(1,-1).T).item()
+                            print(f"[TEST_CONS] tid=T{track_id} sim_raw_vs_cons={sim_cons:.3f} count={size}")
                 else:
                     # Rejeitado por stride
                     pass

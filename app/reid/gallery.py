@@ -16,6 +16,7 @@ from __future__ import annotations
 import torch
 import time
 import numpy as np
+import torch.nn.functional as F
 from typing import Dict, List, Optional, Tuple
 
 # ============================================================
@@ -160,6 +161,7 @@ class Gallery:
         # MÉDIA: mais estável que mediana para Re-ID
         # ============================================================
         mean_emb = stacked.mean(dim=0)
+        mean_emb = F.normalize(mean_emb, p=2, dim=0)
         return mean_emb
 
     def get_all(self, track_id: int) -> List[torch.Tensor]:

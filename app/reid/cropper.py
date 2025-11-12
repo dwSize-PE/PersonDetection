@@ -50,161 +50,30 @@ def _valid(kp: Tuple[float, float, float]) -> bool:
 def crop_body(frame: np.ndarray,
               bbox: Tuple[float, float, float, float],
               keypoints: List[Tuple[float, float, float]],
-              had_pad: bool = False) -> Optional[np.ndarray]:
+              had_pad: bool = False,
+              show_debug: bool = True) -> Optional[np.ndarray]:
     """
-    Recorta corpo (ombro→pernas) baseado em keypoints, removendo cabeça.
-    Aplica pad refletivo se bbox toca borda.
-    
-    Estratégia comercial:
-    - Remove cabeça completamente (melhora discriminação)
-    - Usa ombros como teto do crop
-    - Estende até tornozelos quando disponível
-    - Fallback robusto para keypoints ausentes
-    - Expande lateralmente para capturar silhueta completa
-    - Pad refletivo evita crops cortados nas bordas
-
-    Parâmetros
-    ----------
-    frame : np.ndarray
-        Frame BGR.
-    bbox : (x1, y1, x2, y2)
-        Bounding box da pessoa (YOLO).
-    keypoints : lista de (x, y, conf)
-        17 keypoints COCO format.
-    had_pad : bool
-        Flag do detector indicando toque na borda
-
-    Retorna
-    -------
-    crop : np.ndarray | None
-        Recorte BGR (ombro→pernas) ou None se inválido.
+    Versão de teste — ignora completamente keypoints e lógica corporal.
+    Apenas retorna e exibe a bbox original da pessoa (sem recorte inteligente).
     """
 
+    # Desempacota a bbox (float → int)
+    x1, y1, x2, y2 = map(int, bbox)
+
+    # Garante limites válidos dentro do frame
     h_img, w_img = frame.shape[:2]
-    x1, y1, x2, y2 = bbox
+    x1 = max(0, min(x1, w_img - 1))
+    x2 = max(0, min(x2, w_img - 1))
+    y1 = max(0, min(y1, h_img - 1))
+    y2 = max(0, min(y2, h_img - 1))
 
-    # ============================================================
-    # 1) PAD REFLETIVO — evita cortes quando toca bordas
-    # ============================================================
-    frame_padded = frame
-    offset_x = 0
-    offset_y = 0
-
-    if had_pad or _bbox_touches_border(bbox, (h_img, w_img)):
-        frame_padded = cv2.copyMakeBorder(
-            frame,
-            PAD_REFLECTIVE_SIZE, PAD_REFLECTIVE_SIZE,
-            PAD_REFLECTIVE_SIZE, PAD_REFLECTIVE_SIZE,
-            cv2.BORDER_REFLECT
-        )
-        offset_x = PAD_REFLECTIVE_SIZE
-        offset_y = PAD_REFLECTIVE_SIZE
-        h_img = frame_padded.shape[0]
-        w_img = frame_padded.shape[1]
-        x1 += offset_x
-        x2 += offset_x
-        y1 += offset_y
-        y2 += offset_y
-
-    # ============================================================
-    # 2) EXTRAÇÃO SEGURA DOS KEYPOINTS RELEVANTES
-    # ============================================================
-    kps = keypoints
-    def _get_xy(idx):
-        """Retorna coordenadas ajustadas de um keypoint válido"""
-        if idx < len(kps) and _valid(kps[idx]):
-            return (kps[idx][0] + offset_x, kps[idx][1] + offset_y)
-        return None
-
-    # Grupos anatômicos
-    shoulders = [p for i in (KP_L_SHOULDER, KP_R_SHOULDER) if (p := _get_xy(i))]
-    hips      = [p for i in (KP_L_HIP, KP_R_HIP) if (p := _get_xy(i))]
-    knees     = [p for i in (KP_L_KNEE, KP_R_KNEE) if (p := _get_xy(i))]
-    ankles    = [p for i in (KP_L_ANKLE, KP_R_ANKLE) if (p := _get_xy(i))]
-
-    # ============================================================
-    # 3) DETECÇÃO DE PRESENÇA CORPORAL
-    # ============================================================
-    has_shoulders  = len(shoulders) >= 1
-    has_lower_body = len(hips) >= 1 or len(knees) >= 1 or len(ankles) >= 1
-
-    # Sem região corporal visível (só cabeça/ombros) → aguardar
-    if not has_lower_body:
-        return None
-
-    # ============================================================
-    # 4) TETO DO CROP — ombros (remove cabeça completamente)
-    # ============================================================
-    if has_shoulders:
-        y_top = min(y for _, y in shoulders)
-    elif hips:
-        # fallback: usa quadris se ombros ausentes
-        y_top = min(y for _, y in hips) - 0.4 * (y2 - y1)
-    else:
-        y_top = y1 + 0.25 * (y2 - y1)
-
-    # ============================================================
-    # 5) CHÃO DO CROP — tornozelos, joelhos ou quadris
-    # ============================================================
-    if ankles:
-        y_bottom = max(y for _, y in ankles)
-    elif knees:
-        y_bottom = max(y for _, y in knees) + 0.15 * (y2 - y1)
-    elif hips:
-        y_bottom = max(y for _, y in hips) + 0.40 * (y2 - y1)
-    else:
-        y_bottom = y2
-
-    # ============================================================
-    # 6) LIMITES HORIZONTAIS — união de ombros, quadris e pernas
-    # ============================================================
-    xs = []
-    for group in (shoulders, hips, knees, ankles):
-        xs.extend([x for x, _ in group])
-    if xs:
-        x_left, x_right = min(xs), max(xs)
-    else:
-        x_left, x_right = x1, x2
-
-    # ============================================================
-    # 7) EXPANSÃO LATERAL (±15%) — captura silhueta completa
-    # ============================================================
-    margin_x = 0.15 * (x_right - x_left)
-    x_left -= margin_x
-    x_right += margin_x
-
-    # ============================================================
-    # 8) CLAMP — mantém dentro dos limites válidos
-    # ============================================================
-    x_left   = max(0, int(x_left))
-    x_right  = min(w_img, int(x_right))
-    y_top    = max(0, int(y_top))
-    y_bottom = min(h_img, int(y_bottom))
-
-    # ============================================================
-    # 9) VALIDAÇÃO DE TAMANHO MÍNIMO
-    # ============================================================
-    if x_right - x_left < 20 or y_bottom - y_top < 40:
-        return None
-
-    # ============================================================
-    # 10) EXTRAÇÃO FINAL DO CROP
-    # ============================================================
-    crop = frame_padded[y_top:y_bottom, x_left:x_right]
+    # Cria o crop básico (para caso queira salvar/testar)
+    crop = frame[y1:y2, x1:x2]
     if crop.size == 0:
         return None
 
-    # ============================================================
-    # 11) VALIDA COBERTURA CORPORAL EFETIVA
-    # ============================================================
-    # Garante que o crop abrange ao menos 60% da bbox (corpo visível)
-    height_crop = y_bottom - y_top
-    height_bbox = y2 - y1
-    if height_crop < 0.6 * height_bbox:
-        return None
-
+    # Retorna apenas o crop puro da bbox (sem keypoints, sem expansão)
     return crop
-
 
 def _bbox_touches_border(bbox: Tuple[float, float, float, float],
                          frame_shape: Tuple[int, int]) -> bool:
