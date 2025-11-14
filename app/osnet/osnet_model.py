@@ -48,7 +48,21 @@ class OsNetEmbedder:
 
     @torch.inference_mode()
     def extract_one(self, bgr_image: np.ndarray) -> Optional[torch.Tensor]:
-        """Retorna Tensor (512,), CPU, float32, L2 normalizado."""
+        """
+        Extrai embedding de uma imagem BGR.
+        
+        Retorna Tensor (512,), CPU, float32, L2 normalizado.
+        
+        Parâmetros
+        ----------
+        bgr_image : np.ndarray
+            Imagem BGR (H, W, 3)
+        
+        Retorna
+        -------
+        embedding : torch.Tensor | None
+            Tensor (512,) L2-normalizado ou None se falhar
+        """
         tensor = self._preprocess_bgr(bgr_image)
         if tensor is None:
             return None
@@ -57,7 +71,19 @@ class OsNetEmbedder:
 
     @torch.inference_mode()
     def extract(self, bgr_crops: List[np.ndarray]) -> np.ndarray:
-        """Mantido: retorna np.ndarray (N,512) para usos batch atuais (opcional)."""
+        """
+        Mantido: retorna np.ndarray (N,512) para usos batch atuais (opcional).
+        
+        Parâmetros
+        ----------
+        bgr_crops : list[np.ndarray]
+            Lista de imagens BGR
+        
+        Retorna
+        -------
+        embeddings : np.ndarray
+            Array (N, 512) de embeddings normalizados
+        """
         if not bgr_crops:
             return np.zeros((0, 512), dtype=np.float32)
 
@@ -78,6 +104,10 @@ class OsNetEmbedder:
                 batch = batch.half()
             batch = batch.to(self.device, non_blocking=True)
             v = self.model(batch)                      # (M,512)
+            
+            # ============================================================
+            # NORMALIZA L2 (única normalização necessária)
+            # ============================================================
             v = torch.nn.functional.normalize(v, p=2, dim=1)
             feats_batch = v.detach().float().cpu().numpy()
         else:
@@ -124,16 +154,41 @@ class OsNetEmbedder:
         return t
 
     def _forward_tensor(self, tensor_3chw: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass do OSNet.
+        
+        Retorna embedding (512,) L2-normalizado.
+        
+        Parâmetros
+        ----------
+        tensor_3chw : torch.Tensor
+            Tensor (3, 256, 128) preprocessado
+        
+        Retorna
+        -------
+        embedding : torch.Tensor
+            Tensor (512,) L2-normalizado, CPU, float32
+        """
         if self.half:
             tensor_3chw = tensor_3chw.half()
         x = tensor_3chw.unsqueeze(0).to(self.device, non_blocking=True)  # (1,3,256,128)
         v = self.model(x)                                                # (1,512)
-        print(f"[OSNET_RAW] norm={torch.norm(v, p=2, dim=1).item():.4f} mean={v.mean().item():.4f}")
+        
+        # ============================================================
+        # NORMALIZA L2 (única normalização necessária)
+        # Modelo OSNet retorna embedding cru, normalização é feita aqui
+        # ============================================================
         v = torch.nn.functional.normalize(v, p=2, dim=1)
-        print(f"[OSNET_NORM] norm={torch.norm(v, p=2, dim=1).item():.4f} mean={v.mean().item():.4f}")
+        
+        # ============================================================
+        # LOG DEBUG (opcional - comentar em produção)
+        # ============================================================
+        # print(f"[OSNET_NORM] norm={torch.norm(v, p=2, dim=1).item():.4f} mean={v.mean().item():.4f}")
+        
         return v.detach().float().cpu()[0]  # torch.Tensor (512,)
 
     def _warmup(self):
+        """Warmup do modelo (opcional)"""
         dummy = torch.zeros(1, 3, 256, 128)
         if self.half:
             dummy = dummy.half()

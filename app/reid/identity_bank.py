@@ -1,5 +1,5 @@
 """
-Identity Bank — Banco de identidades globais consolidadas
+Identity Bank – Banco de identidades globais consolidadas
 
 Armazena identidades de pessoas que saíram de cena para Re-ID futuro.
 Cada identidade tem: protótipos multi-escala, cor persistente, metadata completa.
@@ -19,7 +19,6 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 import time
 import torch
-import torch.nn.functional as F
 
 # ============================================================
 # CONFIGURAÇÕES DO BANCO
@@ -157,7 +156,7 @@ class IdentityBank:
         if not self.identities:
             return None
         
-        emb = F.normalize(embedding.detach().cpu(), p=2, dim=0).view(1, -1)  # (1, 512)
+        emb = embedding.detach().cpu().view(1, -1)  # (1, 512) - já normalizado
         
         best_id: Optional[int] = None
         best_sim = -1.0
@@ -218,9 +217,17 @@ class IdentityBank:
         
         return None
 
-    def search_all(self, embedding: torch.Tensor) -> List[Tuple[int, float]]:
+    def search_all(self, embedding: torch.Tensor, scale: str = "MID") -> List[Tuple[int, float]]:
         """
         Busca todas identidades acima do threshold (para Hungarian).
+        Usa protótipo da escala correta.
+        
+        Parâmetros
+        ----------
+        embedding : torch.Tensor
+            Embedding (512,) normalizado
+        scale : str
+            Escala do track ("NEAR", "MID", "FAR")
         
         Retorna
         -------
@@ -230,20 +237,20 @@ class IdentityBank:
         if not self.identities:
             return []
         
-        emb = F.normalize(embedding.detach().cpu(), p=2, dim=0).view(1, -1)
+        emb = embedding.detach().cpu().view(1, -1)  # (1, 512)
         
         results = []
         
         for id_global, identity in self.identities.items():
-            # Usa embedding principal (ou primeiro protótipo disponível)
-            proto = identity.embedding
+            # Usa protótipo da escala correta
+            proto = identity.prototypes.get(scale)
+            
+            if proto is None:
+                # Fallback: embedding principal
+                proto = identity.embedding
             
             if proto is None or proto.numel() == 0:
-                # Fallback: primeiro protótipo disponível
-                if identity.prototypes:
-                    proto = next(iter(identity.prototypes.values()))
-                else:
-                    continue
+                continue
             
             proto = proto.view(1, -1)
             sim = float(torch.matmul(emb, proto.T).item())
@@ -293,15 +300,18 @@ class IdentityBank:
         id_global = self._next_id_global
         self._next_id_global += 1
         
-        emb = F.normalize(embedding.detach().cpu(), p=2, dim=0)
+        # ============================================================
+        # EMBEDDING JÁ NORMALIZADO (OSNet faz isso)
+        # ============================================================
+        emb = embedding.detach().cpu()
         
         # ============================================================
-        # NORMALIZA PROTÓTIPOS
+        # PROTÓTIPOS JÁ NORMALIZADOS (Gallery usa medoid = embedding real)
         # ============================================================
-        normalized_protos = {}
+        stored_protos = {}
         if prototypes:
             for scale, proto in prototypes.items():
-                normalized_protos[scale] = F.normalize(proto.detach().cpu(), p=2, dim=0)
+                stored_protos[scale] = proto.detach().cpu()
         
         # ============================================================
         # CALCULA TTL INICIAL
@@ -323,7 +333,7 @@ class IdentityBank:
         
         self.identities[id_global] = Identity(
             id_global=id_global,
-            prototypes=normalized_protos,
+            prototypes=stored_protos,
             embedding=emb,
             color=color,
             last_seen_frame=frame_index,
@@ -346,7 +356,7 @@ class IdentityBank:
         # ============================================================
         # LOG: BANK_ADD
         # ============================================================
-        n_protos = len(normalized_protos)
+        n_protos = len(stored_protos)
         print(f"[BANK_ADD] pid=P{id_global:02d} ttl={ttl:.0f}s zone=? health={health_initial:.2f} protos={n_protos}")
         
         return id_global
@@ -382,7 +392,10 @@ class IdentityBank:
         
         identity = self.identities[id_global]
         
-        new_emb = F.normalize(new_embedding.detach().cpu(), p=2, dim=0)
+        # ============================================================
+        # EMBEDDING JÁ NORMALIZADO (OSNet faz isso)
+        # ============================================================
+        new_emb = new_embedding.detach().cpu()
         
         # ============================================================
         # α ADAPTATIVO (baseado em health)
@@ -395,7 +408,11 @@ class IdentityBank:
         # EMA: suaviza mudanças bruscas de aparência
         # ============================================================
         updated_emb = (1 - alpha) * identity.embedding + alpha * new_emb
-        identity.embedding = F.normalize(updated_emb, p=2, dim=0)
+        
+        # ============================================================
+        # NORMALIZA APÓS EMA (EMA quebra normalização)
+        # ============================================================
+        identity.embedding = torch.nn.functional.normalize(updated_emb, p=2, dim=0)
         
         # ============================================================
         # ATUALIZA METADATA
@@ -435,7 +452,7 @@ class IdentityBank:
         scale : str
             "NEAR", "MID", "FAR"
         new_embedding : torch.Tensor
-            Novo embedding da escala
+            Novo embedding da escala (já normalizado)
         alpha : float
             Momentum EMA
         """
@@ -443,7 +460,11 @@ class IdentityBank:
             return
         
         identity = self.identities[id_global]
-        new_emb = F.normalize(new_embedding.detach().cpu(), p=2, dim=0)
+        
+        # ============================================================
+        # EMBEDDING JÁ NORMALIZADO (OSNet faz isso)
+        # ============================================================
+        new_emb = new_embedding.detach().cpu()
         
         if scale in identity.prototypes:
             # ============================================================
@@ -451,10 +472,14 @@ class IdentityBank:
             # ============================================================
             old_proto = identity.prototypes[scale]
             updated_proto = (1 - alpha) * old_proto + alpha * new_emb
-            identity.prototypes[scale] = F.normalize(updated_proto, p=2, dim=0)
+            
+            # ============================================================
+            # NORMALIZA APÓS EMA
+            # ============================================================
+            identity.prototypes[scale] = torch.nn.functional.normalize(updated_proto, p=2, dim=0)
         else:
             # ============================================================
-            # CRIA NOVO PROTÓTIPO
+            # CRIA NOVO PROTÓTIPO (já normalizado)
             # ============================================================
             identity.prototypes[scale] = new_emb
 

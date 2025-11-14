@@ -1,5 +1,5 @@
 """
-Gallery — Buffer temporal de embeddings de qualidade por track_id
+Gallery – Buffer temporal de embeddings de qualidade por track_id
 
 Armazena histórico de embeddings bons (pós-gate) enquanto track está ativo.
 Quando track some, esses embeddings são consolidados para Re-ID.
@@ -9,7 +9,8 @@ Estratégia comercial:
 - Stride temporal ≥50ms (evita redundância)
 - Aceita apenas embeddings que passaram pelo gate de qualidade
 - Metadata completa: scale, blur_z, aspect_ratio, HSV, timestamp
-- Suporta análise de diversidade (multi-escala, variação aspect/HSV)
+- Protótipos MULTI-ESCALA via medoid (não média simples)
+- Rejeição automática de outliers (sim < 0.70)
 """
 
 from __future__ import annotations
@@ -24,6 +25,11 @@ from typing import Dict, List, Optional, Tuple
 # ============================================================
 BUFFER_SIZE = 10        # cap reduzida (vs 15 original) para eficiência
 STRIDE_MS = 50          # stride mínimo entre embeddings (ms)
+
+# ============================================================
+# OUTLIER REJECTION
+# ============================================================
+OUTLIER_SIM_THRESHOLD = 0.70  # rejeita embeddings com sim < 0.70 ao medoid
 
 
 class Gallery:
@@ -135,9 +141,9 @@ class Gallery:
 
     def get(self, track_id: int) -> Optional[torch.Tensor]:
         """
-        Retorna embedding médio (consolidado) do track.
+        [DEPRECATED] Retorna embedding médio (compatibilidade).
         
-        Usado para Re-ID quando track some ou atinge min_samples.
+        Use get_prototypes() para multi-escala (recomendado).
         
         Retorna
         -------
@@ -158,11 +164,151 @@ class Gallery:
         stacked = torch.stack(embs, dim=0)  # (N, 512)
         
         # ============================================================
-        # MÉDIA: mais estável que mediana para Re-ID
+        # MÉDIA: compatibilidade com código legado
         # ============================================================
         mean_emb = stacked.mean(dim=0)
+        
+        # ============================================================
+        # NORMALIZA APÓS MEAN (mean quebra normalização)
+        # ============================================================
         mean_emb = F.normalize(mean_emb, p=2, dim=0)
         return mean_emb
+
+    def get_prototypes(self, track_id: int) -> Dict[str, torch.Tensor]:
+        """
+        Retorna protótipos multi-escala via medoid + outlier rejection.
+        
+        Estratégia comercial (Hikvision/Face++):
+        - Agrupa embeddings por escala (NEAR/MID/FAR)
+        - Para cada escala: calcula medoid (embedding mais central)
+        - Rejeita outliers (sim < 0.70 ao medoid)
+        - Retorna protótipos robustos
+        
+        Parâmetros
+        ----------
+        track_id : int
+            ID do track
+        
+        Retorna
+        -------
+        prototypes : dict
+            {"NEAR": Tensor(512,), "MID": Tensor(512,), "FAR": Tensor(512,)}
+            Escalas sem embeddings suficientes são omitidas
+        """
+        if track_id not in self.data:
+            return {}
+        
+        lst = self.data[track_id]
+        if not lst:
+            return {}
+
+        # ============================================================
+        # AGRUPA EMBEDDINGS POR ESCALA
+        # ============================================================
+        by_scale: Dict[str, List[torch.Tensor]] = {"NEAR": [], "MID": [], "FAR": []}
+        
+        for item in lst:
+            scale = item['scale']  # type: ignore
+            emb = item['emb']      # type: ignore
+            
+            if scale in by_scale:
+                by_scale[scale].append(emb)
+        
+        # ============================================================
+        # CALCULA MEDOID + OUTLIER REJECTION PARA CADA ESCALA
+        # ============================================================
+        prototypes = {}
+        
+        for scale, embs in by_scale.items():
+            if len(embs) < 2:
+                # Mínimo 2 embeddings para calcular medoid
+                continue
+            
+            # Calcula medoid
+            medoid = self._compute_medoid(embs)
+            
+            # Rejeita outliers
+            filtered = self._reject_outliers(embs, medoid)
+            
+            if filtered:
+                # Recalcula medoid com embeddings filtrados
+                prototypes[scale] = self._compute_medoid(filtered)
+        
+        return prototypes
+
+    def _compute_medoid(self, embeddings: List[torch.Tensor]) -> torch.Tensor:
+        """
+        Calcula medoid (embedding mais central).
+        
+        Medoid = embedding com maior soma de similaridades aos demais.
+        Mais robusto que média simples (não dilui características).
+        
+        Parâmetros
+        ----------
+        embeddings : list[Tensor]
+            Lista de embeddings (512,) normalizados
+        
+        Retorna
+        -------
+        medoid : Tensor
+            Embedding mais central (512,)
+        """
+        if len(embeddings) == 1:
+            return embeddings[0]
+        
+        # ============================================================
+        # EMPILHA EMBEDDINGS: (N, 512)
+        # ============================================================
+        stacked = torch.stack(embeddings, dim=0)  # (N, 512)
+        
+        # ============================================================
+        # MATRIZ DE SIMILARIDADE: (N, N)
+        # ============================================================
+        sim_matrix = torch.matmul(stacked, stacked.T)  # (N, N)
+        
+        # ============================================================
+        # SOMA SIMILARIDADES POR EMBEDDING (excluindo diagonal)
+        # ============================================================
+        sim_sums = sim_matrix.sum(dim=1) - 1.0  # subtrai diagonal (sim consigo mesmo = 1.0)
+        
+        # ============================================================
+        # RETORNA EMBEDDING COM MAIOR SOMA (mais central)
+        # ============================================================
+        medoid_idx = sim_sums.argmax().item()
+        return embeddings[medoid_idx]
+
+    def _reject_outliers(self, 
+                        embeddings: List[torch.Tensor],
+                        medoid: torch.Tensor) -> List[torch.Tensor]:
+        """
+        Rejeita embeddings com similaridade baixa ao medoid.
+        
+        Threshold: sim >= 0.70 (conservador para Re-ID comercial).
+        
+        Parâmetros
+        ----------
+        embeddings : list[Tensor]
+            Lista de embeddings (512,)
+        medoid : Tensor
+            Embedding de referência (512,)
+        
+        Retorna
+        -------
+        filtered : list[Tensor]
+            Embeddings coesos (sim >= 0.70 ao medoid)
+        """
+        filtered = []
+        
+        medoid_view = medoid.view(1, -1)  # (1, 512)
+        
+        for emb in embeddings:
+            emb_view = emb.view(1, -1)  # (1, 512)
+            sim = float(torch.matmul(emb_view, medoid_view.T).item())
+            
+            if sim >= OUTLIER_SIM_THRESHOLD:
+                filtered.append(emb)
+        
+        return filtered
 
     def get_all(self, track_id: int) -> List[torch.Tensor]:
         """
