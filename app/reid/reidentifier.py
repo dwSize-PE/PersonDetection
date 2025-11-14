@@ -441,6 +441,9 @@ class ReIdentifier:
             pid: ID global se confirmado
             pending: True se ainda em confirmação (K-window não completo)
         """
+        
+        t0_reid = time.perf_counter()
+        
         match = self._hungarian_search(
             track_id=track_id,
             embedding=emb_cons,
@@ -450,6 +453,9 @@ class ReIdentifier:
 
         if match is None:
             # Sem candidato com custo aceitável
+            t1_reid = time.perf_counter()
+            reid_ms = (t1_reid - t0_reid) * 1000.0
+            print(f"[REID_TIME] tid=T{track_id} result=NO_CANDIDATE time={reid_ms:.1f}ms")
             return None, False
 
         pid, similarity, cost = match
@@ -459,6 +465,9 @@ class ReIdentifier:
 
         if not mfss_pass:
             print(f"{LOG_PREFIX_CAND} tid=T{track_id} pid=P{pid:02d} pass=NO reason={mfss_stats.get('reason','unknown')}")
+            t1_reid = time.perf_counter()
+            reid_ms = (t1_reid - t0_reid) * 1000.0
+            print(f"[REID_TIME] tid=T{track_id} pid=P{pid:02d} result=MFSS_FAIL time={reid_ms:.1f}ms")
             return None, False
 
         # K-window
@@ -470,6 +479,9 @@ class ReIdentifier:
         print(f"{LOG_PREFIX_CAND} tid=T{track_id} pid=P{pid:02d} K={k_current}/{k_total} MFSS={mfss:.2f} margin={margin:.2f} pass=YES")
 
         if not k_confirmed:
+            t1_reid = time.perf_counter()
+            reid_ms = (t1_reid - t0_reid) * 1000.0
+            print(f"[REID_TIME] tid=T{track_id} pid=P{pid:02d} result=K_PENDING time={reid_ms:.1f}ms")
             return None, True
 
         # Anti-teleport
@@ -479,6 +491,9 @@ class ReIdentifier:
             # Reset janela K
             if track_id in self._k_window:
                 self._k_window[track_id].clear()
+            t1_reid = time.perf_counter()
+            reid_ms = (t1_reid - t0_reid) * 1000.0
+            print(f"[REID_TIME] tid=T{track_id} pid=P{pid:02d} result=TELEPORT_FAIL time={reid_ms:.1f}ms")
             return None, False
 
         # Confirmação final → promove
@@ -495,7 +510,12 @@ class ReIdentifier:
             self._last_position[pid] = (cx, cy)
             self._last_pos_time[pid] = time.time()
 
-        print(f"{LOG_PREFIX_OK} tid=T{track_id}⇒pid=P{pid:02d} K={k_current}/{k_total} lock={lock_frames} MFSS={mfss:.2f}")
+        print(f"{LOG_PREFIX_OK} tid=T{track_id} pid=P{pid:02d} K={k_current}/{k_total} lock={lock_frames} MFSS={mfss:.2f}")
+        
+        t1_reid = time.perf_counter()
+        reid_ms = (t1_reid - t0_reid) * 1000.0
+        print(f"[REID_TIME] tid=T{track_id} pid=P{pid:02d} result=SUCCESS time={reid_ms:.1f}ms")
+        
         return pid, False
 
     # =========================================================================

@@ -8,7 +8,7 @@ Responsabilidades:
 - Fornecer interface limpa para sistema Re-ID
 """
 
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 import numpy as np
 
 from .bytetrack.byte_tracker import BYTETracker, STrack
@@ -62,7 +62,8 @@ class ByteTrackWrapper:
 
     def update(self, 
                detections: List[List[Any]], 
-               frame_shape: Tuple[int, int]) -> Dict[str, List[Dict[str, Any]]]:
+               frame_shape: Tuple[int, int],
+               external_frame_id: Optional[int] = None) -> Dict[str, List[Dict[str, Any]]]:
         """
         Atualiza tracker com novas detecções.
         
@@ -85,7 +86,12 @@ class ByteTrackWrapper:
         """
         
         self.frame_h, self.frame_w = frame_shape
-        self.frame_id += 1
+        
+        # Sincroniza ID do frame se fornecido (evita drift)
+        if external_frame_id is not None:
+            self.frame_id = external_frame_id
+        else:
+            self.frame_id += 1
         
         if len(detections) == 0:
             # ============================================================

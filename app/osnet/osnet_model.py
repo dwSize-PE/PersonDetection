@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import time
 import warnings
 from typing import List, Optional, cast
 
@@ -66,7 +67,22 @@ class OsNetEmbedder:
         tensor = self._preprocess_bgr(bgr_image)
         if tensor is None:
             return None
+        
+        # ============================================================
+        # OSNET FORWARD (com timing)
+        # ============================================================
+        t0_osnet = time.perf_counter()
         feat = self._forward_tensor(tensor)  # torch.Tensor (512,)
+        t1_osnet = time.perf_counter()
+        osnet_ms = (t1_osnet - t0_osnet) * 1000.0
+        
+        # Log a cada 30 extrações (evita flood)
+        if not hasattr(self, '_osnet_count'):
+            self._osnet_count = 0
+        self._osnet_count += 1
+        if self._osnet_count % 30 == 0:
+            print(f"[OSNET_TIME] extraction #{self._osnet_count} time={osnet_ms:.1f}ms")
+        
         return feat
 
     @torch.inference_mode()
