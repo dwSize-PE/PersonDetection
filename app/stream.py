@@ -107,8 +107,14 @@ def start_stream():
     # =========================================================================
     # Buffer de frames: guarda (frame_index: frame)
     # Permite recuperar o frame EXATO que o YOLO processou (mesmo com atraso)
+    # 
+    # DIMENSIONAMENTO:
+    # - BUFFER_MAX_SIZE = (atraso_detector_em_segundos × FPS) + margem
+    # - 120 frames @ 30fps = 4 segundos de atraso máximo suportado
+    # - Se detector levar > 4s, frames expiram → [CRITICAL_SYNC]
+    # - Se isso ocorre: aumentar buffer OU otimizar detector
     frame_buffer = {} 
-    BUFFER_MAX_SIZE = 60
+    BUFFER_MAX_SIZE = 120  # Aumentado de 60 para 120 (suporta atraso maior do detector)
     
     while True:
         cap = cv2.VideoCapture(VIDEO_PATH)
@@ -117,7 +123,25 @@ def start_stream():
             time.sleep(1)
             continue
 
+        # =========================================================================
+        # RESET DE ESTADO ENTRE LOOPS (IMPORTANTE!)
+        # =========================================================================
+        # Reseta caches do detector (histerese de escala)
+        app.detector.reset_detector_state()
+        
+        # Reseta caches dinâmicos do Re-ID (penalidades, MFSS, K-window)
+        # Mantém banco de identidades para Re-ID em novo loop
+        reid.reset_dynamic_cache()
+        
+        # Limpa tracks temporários (pendências de tracking)
+        lost_fired.clear()
+        
+        # Log informativo sobre dimensionamento
         fps = 30.0
+        buffer_time_seconds = BUFFER_MAX_SIZE / fps
+        bank_count = reid.bank.size()
+        print(f"[STREAM_RESET] Caches e estado resetados para novo loop")
+        print(f"[CONFIG] BUFFER: {BUFFER_MAX_SIZE} frames = {buffer_time_seconds:.1f}s @ {fps}fps | BANK: {bank_count} identidades (TTL 30-300s)")
         
         frame_interval = 1.0 / fps
         next_frame_time = time.time()
@@ -168,17 +192,24 @@ def start_stream():
             if det_result is not None:
                 detections, det_frame_idx = det_result
                 
-                # Recupera o frame original correspondente a esta detecção
-                if det_frame_idx in frame_buffer:
-                    frame = frame_buffer[det_frame_idx]
-                    # Limpa frames mais antigos que este (já processados ou pulados)
-                    keys_to_remove = [k for k in frame_buffer.keys() if k < det_frame_idx]
-                    for k in keys_to_remove:
-                        del frame_buffer[k]
-                else:
-                    # Fallback raro: frame expirou do buffer (detector muito lento)
-                    frame = raw_frame
-                    print(f"[SYNC_WARN] Frame {det_frame_idx} expired from buffer!")
+                # ============================================================
+                # VALIDAÇÃO OBRIGATÓRIA #1: Frame deve estar no buffer
+                # Se não estiver, descarta resultado (detector muito lento)
+                # ============================================================
+                if det_frame_idx not in frame_buffer:
+                    print(f"[CRITICAL_SYNC] Frame {det_frame_idx} expired from buffer! "
+                          f"buffer_size={len(frame_buffer)} buffer_range=[{min(frame_buffer.keys()) if frame_buffer else 'empty'}-{max(frame_buffer.keys()) if frame_buffer else 'empty'}] "
+                          f"max_size={BUFFER_MAX_SIZE} (detector muito lento)")
+                    print(f"[CRITICAL_SYNC] Discarding detection result to maintain sync")
+                    continue  # Pula este update – aguarda próximo detector result
+                
+                # Frame está válido no buffer
+                frame = frame_buffer[det_frame_idx]
+                
+                # Limpa frames mais antigos que este (já processados ou pulados)
+                keys_to_remove = [k for k in frame_buffer.keys() if k < det_frame_idx]
+                for k in keys_to_remove:
+                    del frame_buffer[k]
 
                 frame_h, frame_w = frame.shape[:2]
 
@@ -232,25 +263,10 @@ def start_stream():
                 with lock_tracks:
                     shared_tracks['tracks'] = all_active
                     shared_tracks['temp_lost'] = temp_lost_tracks
+                    shared_tracks['frame_index'] = det_frame_idx  # NOVO: sincronização mútua
                     shared_tracks['density'] = density_smooth
                     shared_tracks['frame_height'] = frame_h
                 
-                # ============================================================
-                # DENSITY SUAVIZADA (EMA α=0.2)
-                # ============================================================
-                density_instant = len(all_active) / ((frame_h * frame_w) / 1000.0)
-                density_smooth = 0.8 * density_smooth + 0.2 * density_instant
-                
-                with lock_frame:
-                    shared_frame['frame'] = frame.copy()
-                    shared_frame['frame_index'] = frame_idx
-
-                with lock_tracks:
-                    shared_tracks['tracks'] = all_active
-                    shared_tracks['temp_lost'] = temp_lost_tracks
-                    shared_tracks['density'] = density_smooth
-                    shared_tracks['frame_height'] = frame_h
-
                 # ============================================================
                 # STEP 4: PROCESSA PENDING PARA RE-ID (Hungarian + MFSS + K)
                 # ============================================================

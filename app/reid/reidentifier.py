@@ -115,7 +115,7 @@ class ReIdentifier:
 
     API pública (compatível):
       - on_new_track(track_id, embedding, frame_index, bbox=None, density=0.0, frame_height=1080) -> Optional[int]
-      - on_track_active(track_id, embedding, frame_index) -> None
+      - on_track_active(track_id, embedding, frame_index, bbox=None, frame_height=1080) -> None
       - on_track_lost(track_id, frame_index, frame_height=1080) -> Optional[int]
       - get_global_id(track_id) -> Optional[int]
       - get_color(track_id) -> Tuple[int,int,int]
@@ -174,13 +174,16 @@ class ReIdentifier:
     def on_track_active(self,
                         track_id: int,
                         embedding: torch.Tensor,
-                        frame_index: int) -> None:
+                        frame_index: int,
+                        bbox: Optional[Tuple[float, float, float, float]] = None,
+                        frame_height: int = 1080) -> None:
         """
         Chamado frame a frame para tracks ATIVOS.
         Objetivo: se já estiver promovido, tentar EMA guardado do protótipo.
 
         Observações:
           • Antes estava vazio (lacuna preenchida)
+          • Agora detecta ESCALA dinâmica se bbox disponível (scale-aware)
           • Continua leve (não bloqueia pipeline)
         """
         if track_id not in self._track_to_global:
@@ -196,21 +199,30 @@ class ReIdentifier:
         # ============================================================
         emb = embedding.detach().cpu()
         
-        # Similaridade com embedding principal do banco
-        sim = float(torch.matmul(emb.view(1, -1), identity.embedding.view(1, -1).T).item())
+        # ============================================================
+        # DETECTA ESCALA DINÂMICA (PROBLEMA A RESOLVIDO)
+        # ============================================================
+        track_scale = self._detect_scale(bbox, frame_height)
+        
+        # Similaridade com protótipo da ESCALA CORRETA (não embedding genérico)
+        proto = identity.prototypes.get(track_scale)
+        if proto is None:
+            proto = identity.embedding
+        
+        sim = float(torch.matmul(emb.view(1, -1), proto.view(1, -1).T).item())
 
         updated = self.update_prototype(
             pid=pid,
             track_id=track_id,
             embedding=embedding,
             similarity=sim,
-            scale="MID",  # escala desconhecida aqui – use "MID" (neutro)
+            scale=track_scale,  # AGORA DINÂMICO (escala real)
             hsv_mean=np.zeros(3, dtype=np.float32),
             frame_index=frame_index
         )
 
         if updated:
-            print(f"{LOG_PREFIX_PIDU} pid=P{pid:02d} tid=T{track_id} sim={sim:.3f} (EMA guard ok)")
+            print(f"{LOG_PREFIX_PIDU} pid=P{pid:02d} tid=T{track_id} scale={track_scale} sim={sim:.3f} (EMA guard ok)")
         else:
             # log enxuto; o detalhe do guard está dentro do update_prototype
             pass
@@ -864,15 +876,19 @@ class ReIdentifier:
                          hsv_mean: np.ndarray,
                          frame_index: int) -> bool:
         """
-        Atualiza protótipo do PID com guards:
+        Atualiza protótipo do PID com guards SCALE-AWARE:
 
           • lock countdown == 0
-          • sim ≥ thr_in_pid + 0.05
+          • sim ≥ thr_in_pid + 0.05 (comparado contra protótipo da ESCALA CORRETA)
           • ΔHSV ≤ 12 (placeholder)
           • sem conflito com outro PID (placeholder)
 
-        Em seguida, aplica update no banco (EMA adaptativo no IdentityBank.update()).
+        Em seguida, aplica update no banco com EMA por escala (IdentityBank.update_prototype()).
         """
+        identity = self.bank.get(pid)
+        if identity is None:
+            return False
+        
         # GUARD 1 – lock
         lock = self._lock_countdown.get(pid, 0)
         if lock > 0:
@@ -880,36 +896,65 @@ class ReIdentifier:
             print(f"[EMA_UPD] pid=P{pid:02d} scale={scale} sim={similarity:.2f} guards_ok=NO (lock={lock})")
             return False
 
-        # GUARD 2 – similaridade mínima
+        # GUARD 2 – similaridade mínima contra PROTÓTIPO DA ESCALA (PROBLEMA B RESOLVIDO)
+        # Se a escala tem protótipo, valida contra aquele. Senão, usa threshold base.
+        if scale in identity.prototypes:
+            # Recomputa sim contra protótipo da escala para validação mais precisa
+            proto_scale = identity.prototypes[scale]
+            emb = embedding.detach().cpu().view(1, -1)
+            similarity_scale = float(torch.matmul(emb, proto_scale.view(1, -1).T).item())
+        else:
+            # Primeira vez vendo essa escala, usa baseline
+            similarity_scale = similarity
+        
         thr_in_pid = self._compute_adaptive_threshold(pid)
         sim_min = thr_in_pid + EMA_SIM_MIN_OFFSET
-        if similarity < sim_min:
-            print(f"[EMA_UPD] pid=P{pid:02d} scale={scale} sim={similarity:.2f} guards_ok=NO (sim<{sim_min:.2f})")
+        if similarity_scale < sim_min:
+            print(f"[EMA_UPD] pid=P{pid:02d} scale={scale} sim={similarity_scale:.2f} guards_ok=NO (sim<{sim_min:.2f})")
             return False
 
         # GUARD 3 – ΔHSV (placeholder: aceita)
         # GUARD 4 – Oclusão (placeholder: aceita)
         # GUARD 5 – Conflito (placeholder: aceita)
 
-        # α adaptativo por health (IdentityBank.update já ajusta, mas mantemos log)
+        # α adaptativo por health
         health = self.bank.get_health(pid) or 1.0
         alpha = max(EMA_ALPHA_MIN, min(EMA_ALPHA_MAX, 0.10 - 0.05 * health))
 
-        # Atualiza embedding principal (EMA dentro do banco)
+        # Atualiza embedding principal (EMA no embedding geral) + protótipo por escala
         self.bank.update(pid, embedding, frame_index)
+        self.bank.update_prototype(pid, scale, embedding, alpha)
 
-        print(f"[EMA_UPD] pid=P{pid:02d} scale={scale} sim={similarity:.2f} α={alpha:.2f} guards_ok=YES")
+        print(f"[EMA_UPD] pid=P{pid:02d} scale={scale} sim={similarity_scale:.2f} α={alpha:.2f} guards_ok=YES")
         return True
 
     # =========================================================================
     # SINCRONIZAÇÃO BANCO ← GALLERY (quando já promovido)
     # =========================================================================
     def _update_bank_from_gallery(self, track_id: int, id_global: int, frame_index: int) -> None:
+        """
+        Consolida embeddings multi-escala da gallery → IdentityBank (PROBLEMA C RESOLVIDO).
+        
+        Estratégia: se há protótipos por escala, atualiza cada um individualmente.
+        Senão, usa embedding médio (fallback).
+        """
         if not self.gallery.exists(track_id):
             return
-        consolidated_emb = self.gallery.get(track_id)
-        if consolidated_emb is not None:
-            self.bank.update(id_global, consolidated_emb, frame_index)
+        
+        # Tenta consolidar com protótipos multi-escala
+        prototypes_multi = self.gallery.get_prototypes(track_id)
+        
+        if prototypes_multi:
+            # Consolida cada escala separadamente (scale-aware)
+            for scale, proto in prototypes_multi.items():
+                self.bank.update_prototype(id_global, scale, proto, alpha=0.15)
+            print(f"[BANK_CONS] tid=T{track_id} pid=P{id_global:02d} consolidated {len(prototypes_multi)} scales")
+        else:
+            # Fallback: embedding médio (compatibilidade)
+            consolidated_emb = self.gallery.get(track_id)
+            if consolidated_emb is not None:
+                self.bank.update(id_global, consolidated_emb, frame_index)
+                print(f"[BANK_CONS] tid=T{track_id} pid=P{id_global:02d} consolidated via avg (no protos)")
 
     # =========================================================================
     # QUERIES (públicos)
@@ -968,6 +1013,47 @@ class ReIdentifier:
         self._negate_timestamp.clear()
         self._last_position.clear()
         self._last_pos_time.clear()
+
+    def reset_dynamic_cache(self) -> None:
+        """
+        Reseta apenas caches dinâmicos entre loops de vídeo.
+        Mantém banco de identidades intacto (para Re-ID em novo loop).
+        
+        DEVE ser chamado em stream.py quando novo loop começa.
+        Evita que histerese e penalidades velhas contaminem novo loop.
+        
+        ============================================================
+        IMPORTANTE: O que é resetado vs preservado
+        ============================================================
+        RESETADO (porque depende de track_id que muda a cada loop):
+        - _track_to_global: mapeamento track_id → id_global (novo loop = novos track_ids)
+        - _track_colors: cores temporárias de tracking
+        - gallery: buffer temporal de embeddings (está associado a track_id ativo)
+        - Todos os caches dinâmicos (MFSS, K-window, NEGATE, posição, etc)
+        
+        PRESERVADO (identidades globais consolidadas - válidas entre loops):
+        - IdentityBank (self.bank): contém pessoas já identificadas com protótipos
+          └─ Cada identidade: id_global, protótipos multi-escala, cor, health, TTL
+          └─ Estas NÃO expiram imediatamente - TTL até 5 minutos
+          └─ Permite Re-ID em novo loop: mesma pessoa = mesmo PID
+        
+        Fluxo esperado:
+        1. Loop 1: pessoa aparece → gallery coleta embeddings → track some → consolida no banco (PID=1)
+        2. Loop 2: pessoa reaparece → busca no banco → encontra PID=1 → reutiliza
+        3. Loop 5 minutos depois: se pessoa não reapareceu → TTL expira → remove do banco
+        """
+        self._mfss_cache.clear()                 # similaridade temporal (MFSS)
+        self._k_window.clear()                   # janela K (confirmações)
+        self._k_last_update.clear()              # timestamp última atualização K
+        self._lock_countdown.clear()             # countdown de lock adaptativo
+        self._negate_timestamp.clear()           # penalidades de erro (muito importante!)
+        self._last_position.clear()              # cache de posição para anti-teleport
+        self._last_pos_time.clear()              # timestamp última posição
+        self._track_to_global.clear()            # mapping track → id_global (NOVO cada loop)
+        self._track_colors.clear()               # colors temporárias de tracking (NOVO cada loop)
+        self.gallery.clear_all()                 # gallery = buffer TEMPORÁRIO (depende de track_id)
+        bank_size = self.bank.size()
+        print(f"{LOG_PREFIX_BANKSYNC} Dynamic cache resetado para novo loop (banco com {bank_size} identidades preservadas)")
 
     # =========================================================================
     # UTILITÁRIOS

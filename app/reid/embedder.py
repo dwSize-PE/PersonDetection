@@ -138,7 +138,7 @@ class ReIDEmbedderThread:
             # ============================================================
             with self.lock_frame:
                 frame: Optional[np.ndarray] = self.shared_frame.get('frame')
-                frame_index: int = self.shared_frame.get('frame_index', 0)
+                frame_index: int = self.shared_frame.get('frame_index', -1)
 
             if frame is None:
                 continue
@@ -153,6 +153,20 @@ class ReIDEmbedderThread:
                 temp_lost_tracks: List[dict] = self.shared_tracks.get('temp_lost', [])
                 density: float = self.shared_tracks.get('density', 0.0)
                 frame_height: int = self.shared_tracks.get('frame_height', 1080)
+                tracks_frame_index: int = self.shared_tracks.get('frame_index', -1)
+
+            # ============================================================
+            # VALIDAÇÃO OBRIGATÓRIA #2: Mutual check frame_index
+            # Se desincronizados, frame pode estar errado – skip ciclo
+            # ============================================================
+            if frame_index != tracks_frame_index:
+                print(f"[EMBEDDER_DESYNC] Frame={frame_index} Tracks={tracks_frame_index} "
+                      f"(misaligned) - skipping cycle")
+                continue
+
+            if frame_index < 0:
+                # Frame index ainda não inicializado
+                continue
 
             if not tracks:
                 # Sem tracks ativos – atualiza cache e continua
@@ -229,7 +243,8 @@ class ReIDEmbedderThread:
                     conf=conf,
                     scale=scale,
                     bbox=bbox,
-                    frame_shape=(frame_h, frame_w)
+                    frame_shape=(frame_h, frame_w),
+                    frame_index=frame_index  # NOVO: validar frame_index
                 )
 
                 if not gate_pass:
@@ -318,8 +333,14 @@ class ReIDEmbedderThread:
                 # - Se track novo: tenta Re-ID após min_samples
                 # ============================================================
                 if self.reid.is_promoted(track_id):
-                    # Track já tem id_global – apenas atualiza Gallery
-                    self.reid.on_track_active(track_id, emb, frame_index)
+                    # Track já tem id_global – apenas atualiza Gallery (com scale-aware EMA)
+                    self.reid.on_track_active(
+                        track_id=track_id,
+                        embedding=emb,
+                        frame_index=frame_index,
+                        bbox=bbox,
+                        frame_height=frame_height
+                    )
                 else:
                     # Track novo – tenta Re-ID (propaga bbox/density/frame_height)
                     id_global = self.reid.on_new_track(
@@ -347,14 +368,21 @@ class ReIDEmbedderThread:
                       conf: float,
                       scale: str,
                       bbox: tuple,
-                      frame_shape: tuple) -> tuple:
+                      frame_shape: tuple,
+                      frame_index: int = -1) -> tuple:
         """
         Gate de qualidade multi-critério.
         
         Critérios:
-        1. conf_yolo ≥ 0.50
-        2. scale ≠ DESC
-        3. bbox dentro do frame (não cortada demais)
+        1. frame_index válido (sincronização)
+        2. conf_yolo ≥ 0.50
+        3. scale ≠ DESC
+        4. bbox dentro do frame (não cortada demais)
+        
+        Parâmetros
+        ----------
+        frame_index : int
+            Frame index para validação de sincronização
         
         Retorna
         -------
@@ -363,6 +391,12 @@ class ReIDEmbedderThread:
         reason : str
             Motivo de rejeição (se fail)
         """
+        # ============================================================
+        # CRITÉRIO 0: frame_index válido (sincronização)
+        # ============================================================
+        if frame_index < 0:
+            return False, "invalid_frame_index"
+        
         # ============================================================
         # CRITÉRIO 1: confiança YOLO
         # ============================================================

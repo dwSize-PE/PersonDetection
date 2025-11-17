@@ -69,6 +69,16 @@ def submit_frame(frame, frame_index):
         pass
 
 
+def reset_detector_state():
+    """
+    Reseta estado global do detector entre loops de vídeo.
+    DEVE ser chamado em stream.py quando novo loop começa (no start_stream).
+    """
+    global _scale_cache
+    _scale_cache.clear()
+    print("[DETECTOR_RESET] _scale_cache limpo")
+
+
 def get_result():
     """
     Recupera resultado do detector (se disponível).
