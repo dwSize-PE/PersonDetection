@@ -1,0 +1,15 @@
+# Educational and Non-Commercial Use License
+
+Copyright (c) 2025 Leonardo de Souza Melo
+
+This software is licensed exclusively for **educational and non-commercial use**. You may use, modify, and distribute the code only for **educational or research purposes**. **Commercial use is not permitted**.
+
+If you wish to use this software for commercial purposes, please contact the author for a commercial license. You can reach the author at **souzaleonardomelo1@gmail.com** to discuss the terms of commercial use.
+
+### Terms:
+1. The code may be used, modified, and distributed **only for educational and non-commercial purposes**.
+2. **Commercial use is not permitted** without a separate commercial license.
+3. The source code must remain **unmodified** when used for educational purposes.
+
+### Limitation of Liability:
+This software is provided "as is", without any warranty of any kind, express or implied. The author shall not be liable for any damages arising from the use of this software.
