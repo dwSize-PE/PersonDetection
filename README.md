@@ -191,7 +191,7 @@ Here's what makes it special:
 Start the detection and tracking:
 
 ```bash
-bash python start.py
+python start.py
 ```
 
 **What you'll see:**
