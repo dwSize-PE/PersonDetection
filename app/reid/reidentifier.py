@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-ReIdentifier — Orquestrador de Re-ID (Gallery ↔ IdentityBank)
+ReIdentifier – Orquestrador de Re-ID (Gallery ↔ IdentityBank)
 
 Reestruturação completa com separação explícita de fases:
   Fase 1) Coleta → criação de PID (pessoa nova)
@@ -21,8 +21,8 @@ Principais melhorias:
   • MFSS e APPT usam top-2 reais (por PID), e K-window com timeout
   • Anti-teleport com cache de posição e tempo (Δt e distância em fração da altura)
   • NEGATE penalty pós-erro com decaimento exponencial
+  • Matching usa protótipo da escala correta (NEAR com NEAR, FAR com FAR)
   • Logs cirúrgicos e coesos, visando depuração comercial (Hikvision/Face++-style)
-
 """
 
 from __future__ import annotations
@@ -104,16 +104,10 @@ LOG_PREFIX_NEG = "[NEGATE]"
 LOG_PREFIX_BANKSYNC = "[BANK_SYNC]"
 LOG_PREFIX_WARN = "[REID_WARN]"
 
-# ============================================================
-# HELPER: normalização segura
-# ============================================================
-def _l2_norm(x: torch.Tensor) -> torch.Tensor:
-    return F.normalize(x.detach().cpu(), p=2, dim=0)
-
 
 class ReIdentifier:
     """
-    Motor de Re-ID — ponte entre tracking temporário e identidades globais.
+    Motor de Re-ID – ponte entre tracking temporário e identidades globais.
 
     Fase 1) Coleta → criação de PID (pessoa nova)
     Fase 2) Re-ID  → matching (Hungarian + MFSS + K + Anti-teleport)
@@ -121,7 +115,7 @@ class ReIdentifier:
 
     API pública (compatível):
       - on_new_track(track_id, embedding, frame_index, bbox=None, density=0.0, frame_height=1080) -> Optional[int]
-      - on_track_active(track_id, embedding, frame_index) -> None
+      - on_track_active(track_id, embedding, frame_index, bbox=None, frame_height=1080) -> None
       - on_track_lost(track_id, frame_index, frame_height=1080) -> Optional[int]
       - get_global_id(track_id) -> Optional[int]
       - get_color(track_id) -> Tuple[int,int,int]
@@ -145,7 +139,7 @@ class ReIdentifier:
         match_threshold : float
             Threshold base de cosine similarity (0.65 = conservador)
         ema_momentum : float
-            Momentum base para atualização EMA (0.20) — (mantém compatibilidade com IdentityBank)
+            Momentum base para atualização EMA (0.20) – (mantém compatibilidade com IdentityBank)
         """
         # Fonte de embeddings temporais
         self.gallery = gallery
@@ -180,13 +174,16 @@ class ReIdentifier:
     def on_track_active(self,
                         track_id: int,
                         embedding: torch.Tensor,
-                        frame_index: int) -> None:
+                        frame_index: int,
+                        bbox: Optional[Tuple[float, float, float, float]] = None,
+                        frame_height: int = 1080) -> None:
         """
         Chamado frame a frame para tracks ATIVOS.
         Objetivo: se já estiver promovido, tentar EMA guardado do protótipo.
 
         Observações:
           • Antes estava vazio (lacuna preenchida)
+          • Agora detecta ESCALA dinâmica se bbox disponível (scale-aware)
           • Continua leve (não bloqueia pipeline)
         """
         if track_id not in self._track_to_global:
@@ -197,22 +194,35 @@ class ReIdentifier:
         if identity is None:
             return
 
-        # Similaridade com embedding principal do banco
-        emb_norm = _l2_norm(embedding)
-        sim = float(torch.matmul(emb_norm.view(1, -1), identity.embedding.view(1, -1).T).item())
+        # ============================================================
+        # EMBEDDING JÁ NORMALIZADO (OSNet faz isso)
+        # ============================================================
+        emb = embedding.detach().cpu()
+        
+        # ============================================================
+        # DETECTA ESCALA DINÂMICA (PROBLEMA A RESOLVIDO)
+        # ============================================================
+        track_scale = self._detect_scale(bbox, frame_height)
+        
+        # Similaridade com protótipo da ESCALA CORRETA (não embedding genérico)
+        proto = identity.prototypes.get(track_scale)
+        if proto is None:
+            proto = identity.embedding
+        
+        sim = float(torch.matmul(emb.view(1, -1), proto.view(1, -1).T).item())
 
         updated = self.update_prototype(
             pid=pid,
             track_id=track_id,
             embedding=embedding,
             similarity=sim,
-            scale="MID",  # escala desconhecida aqui — use "MID" (neutro)
+            scale=track_scale,  # AGORA DINÂMICO (escala real)
             hsv_mean=np.zeros(3, dtype=np.float32),
             frame_index=frame_index
         )
 
         if updated:
-            print(f"{LOG_PREFIX_PIDU} pid=P{pid:02d} tid=T{track_id} sim={sim:.3f} (EMA guard ok)")
+            print(f"{LOG_PREFIX_PIDU} pid=P{pid:02d} tid=T{track_id} scale={track_scale} sim={sim:.3f} (EMA guard ok)")
         else:
             # log enxuto; o detalhe do guard está dentro do update_prototype
             pass
@@ -347,21 +357,32 @@ class ReIdentifier:
         else:
             # Nova identidade
             color = self._track_colors.get(track_id, self._generate_color())
-            pid = self.bank.add(consolidated_emb, color, frame_index)
+            
+            # ============================================================
+            # USA PROTÓTIPOS MULTI-ESCALA (novo)
+            # ============================================================
+            prototypes = self.gallery.get_prototypes(track_id)
+            
+            pid = self.bank.add(
+                embedding=consolidated_emb,
+                color=color,
+                frame_index=frame_index,
+                prototypes=prototypes
+            )
             print(f"[ReID] Track T{track_id} → NOVA identidade RID P{pid:02d}")
             self.gallery.delete(track_id)
             self._cleanup_track_state(track_id)
             return pid
 
     # =========================================================================
-    # ROTA A — CRIAÇÃO DE PID (pessoa nova)
+    # ROTA A – CRIAÇÃO DE PID (pessoa nova)
     # =========================================================================
     def _try_create_pid(self, track_id: int, frame_index: int) -> Optional[int]:
         """
         Tenta criar uma nova identidade global a partir do buffer do track.
         Regras:
           • Exige diversidade (gallery.check_diversity), com timeout override
-          • Gera protótipos multi-escala e grava no banco (corrigido)
+          • Gera protótipos multi-escala e grava no banco
         """
         # Diversidade
         has_diversity, diversity_stats = self.gallery.check_diversity(track_id)
@@ -375,38 +396,36 @@ class ReIdentifier:
                 print(f"{LOG_PREFIX_FLOW} T{track_id} → aguardando diversidade")
                 return None
 
-        # Protótipos por escala
-        by_scale = self.gallery.get_by_scale(track_id)
-        protos = {}
-        proto_scales = []
-
-        for scale in ("NEAR", "MID", "FAR"):
-            embs = by_scale.get(scale, [])
-            if embs:
-                stacked = torch.stack(embs, dim=0)
-                proto = _l2_norm(stacked.mean(dim=0))
-                protos[scale] = proto
-                proto_scales.append(scale)
-
-        if not protos:
+        # ============================================================
+        # PROTÓTIPOS POR ESCALA (novo - usa medoid)
+        # ============================================================
+        prototypes = self.gallery.get_prototypes(track_id)
+        
+        if not prototypes:
             print(f"{LOG_PREFIX_CREATE_FAIL} tid=T{track_id} sem protótipos válidos")
             return None
 
+        proto_scales = list(prototypes.keys())
         fragile = (diversity_stats.get('criterion') == 'timeout_override')
 
         color = self._track_colors.get(track_id, self._generate_color())
-        # Usa um protótipo principal para embedding base (primeiro disponível)
-        main_proto = protos[proto_scales[0]]
+        
+        # ============================================================
+        # USA PRIMEIRO PROTÓTIPO COMO EMBEDDING PRINCIPAL
+        # ============================================================
+        main_proto = prototypes[proto_scales[0]]
 
-        # ✅ grava protótipos multi-escala no banco (antes era perdido)
+        # ============================================================
+        # GRAVA PROTÓTIPOS MULTI-ESCALA NO BANCO
+        # ============================================================
         pid = self.bank.add(
             embedding=main_proto,
             color=color,
             frame_index=frame_index,
-            prototypes=protos
+            prototypes=prototypes
         )
 
-        # Mapeia track → pid (o track AINDA não é “reidentificado”, mas já tem identidade registrada)
+        # Mapeia track → pid (o track AINDA não é "reidentificado", mas já tem identidade registrada)
         self._track_to_global[track_id] = pid
 
         proto_str = ",".join(proto_scales)
@@ -416,7 +435,7 @@ class ReIdentifier:
         return pid
 
     # =========================================================================
-    # ROTA B — RE-IDENTIFICAÇÃO (matching)
+    # ROTA B – RE-IDENTIFICAÇÃO (matching)
     # =========================================================================
     def _try_reidentify(self,
                         track_id: int,
@@ -434,6 +453,9 @@ class ReIdentifier:
             pid: ID global se confirmado
             pending: True se ainda em confirmação (K-window não completo)
         """
+        
+        t0_reid = time.perf_counter()
+        
         match = self._hungarian_search(
             track_id=track_id,
             embedding=emb_cons,
@@ -443,6 +465,9 @@ class ReIdentifier:
 
         if match is None:
             # Sem candidato com custo aceitável
+            t1_reid = time.perf_counter()
+            reid_ms = (t1_reid - t0_reid) * 1000.0
+            print(f"[REID_TIME] tid=T{track_id} result=NO_CANDIDATE time={reid_ms:.1f}ms")
             return None, False
 
         pid, similarity, cost = match
@@ -452,6 +477,9 @@ class ReIdentifier:
 
         if not mfss_pass:
             print(f"{LOG_PREFIX_CAND} tid=T{track_id} pid=P{pid:02d} pass=NO reason={mfss_stats.get('reason','unknown')}")
+            t1_reid = time.perf_counter()
+            reid_ms = (t1_reid - t0_reid) * 1000.0
+            print(f"[REID_TIME] tid=T{track_id} pid=P{pid:02d} result=MFSS_FAIL time={reid_ms:.1f}ms")
             return None, False
 
         # K-window
@@ -463,6 +491,9 @@ class ReIdentifier:
         print(f"{LOG_PREFIX_CAND} tid=T{track_id} pid=P{pid:02d} K={k_current}/{k_total} MFSS={mfss:.2f} margin={margin:.2f} pass=YES")
 
         if not k_confirmed:
+            t1_reid = time.perf_counter()
+            reid_ms = (t1_reid - t0_reid) * 1000.0
+            print(f"[REID_TIME] tid=T{track_id} pid=P{pid:02d} result=K_PENDING time={reid_ms:.1f}ms")
             return None, True
 
         # Anti-teleport
@@ -472,6 +503,9 @@ class ReIdentifier:
             # Reset janela K
             if track_id in self._k_window:
                 self._k_window[track_id].clear()
+            t1_reid = time.perf_counter()
+            reid_ms = (t1_reid - t0_reid) * 1000.0
+            print(f"[REID_TIME] tid=T{track_id} pid=P{pid:02d} result=TELEPORT_FAIL time={reid_ms:.1f}ms")
             return None, False
 
         # Confirmação final → promove
@@ -488,11 +522,16 @@ class ReIdentifier:
             self._last_position[pid] = (cx, cy)
             self._last_pos_time[pid] = time.time()
 
-        print(f"{LOG_PREFIX_OK} tid=T{track_id}⇐pid=P{pid:02d} K={k_current}/{k_total} lock={lock_frames} MFSS={mfss:.2f}")
+        print(f"{LOG_PREFIX_OK} tid=T{track_id} pid=P{pid:02d} K={k_current}/{k_total} lock={lock_frames} MFSS={mfss:.2f}")
+        
+        t1_reid = time.perf_counter()
+        reid_ms = (t1_reid - t0_reid) * 1000.0
+        print(f"[REID_TIME] tid=T{track_id} pid=P{pid:02d} result=SUCCESS time={reid_ms:.1f}ms")
+        
         return pid, False
 
     # =========================================================================
-    # HUNGARIAN SEARCH (custo multi-fator)
+    # HUNGARIAN SEARCH (custo multi-fator + multi-escala)
     # =========================================================================
     def _hungarian_search(self,
                           track_id: int,
@@ -500,9 +539,11 @@ class ReIdentifier:
                           bbox: Optional[Tuple[float, float, float, float]],
                           frame_index: int) -> Optional[Tuple[int, float, float]]:
         """
-        Busca no banco com custo multi-fator:
+        Busca no banco com custo multi-fator + matching multi-escala:
 
           C = w_e·(1-sim) + w_t·pen_t + w_z·pen_z + w_s·pen_s + w_h·(1-h) + NEGATE
+
+        Usa protótipo da escala correta (NEAR com NEAR, FAR com FAR).
 
         Retorna
         -------
@@ -518,15 +559,35 @@ class ReIdentifier:
         if self.bank.size() == 0:
             return None
 
+        # ============================================================
+        # DETECTA ESCALA DO TRACK ATUAL
+        # ============================================================
+        track_scale = self._detect_scale(bbox, self._frame_height)
+
         best_pid = None
         best_sim = -1.0
         best_cost = float('inf')
 
-        emb = _l2_norm(embedding).view(1, -1)
+        # ============================================================
+        # EMBEDDING JÁ NORMALIZADO (OSNet faz isso)
+        # ============================================================
+        emb = embedding.detach().cpu().view(1, -1)  # (1, 512)
 
-        # Varre todas identidades — custo manual
+        # Varre todas identidades – custo manual
         for pid, identity in self.bank.identities.items():
-            proto = identity.embedding.view(1, -1)
+            # ============================================================
+            # USA PROTÓTIPO DA ESCALA CORRETA (novo)
+            # ============================================================
+            proto = identity.prototypes.get(track_scale)
+            
+            if proto is None:
+                # Fallback: embedding principal
+                proto = identity.embedding
+            
+            if proto is None or proto.numel() == 0:
+                continue
+            
+            proto = proto.view(1, -1)  # (1, 512)
             sim = float(torch.matmul(emb, proto.T).item())
 
             # penalidade tempo (proxy simples por frames desde visto)
@@ -566,11 +627,54 @@ class ReIdentifier:
                 best_pid = pid
 
         # valida threshold absoluto mínimo de similaridade
-        if best_pid is None or best_sim < 0.78:
+        if best_pid is None or best_sim < 0.75:
             return None
 
-        print(f"{LOG_PREFIX_HUNG} assign: T{track_id}→P{best_pid:02d} cost={best_cost:.2f} sim={best_sim:.2f}")
+        print(f"{LOG_PREFIX_HUNG} assign: T{track_id}→P{best_pid:02d} cost={best_cost:.2f} sim={best_sim:.2f} scale={track_scale}")
         return best_pid, best_sim, best_cost
+
+    def _detect_scale(self, 
+                     bbox: Optional[Tuple[float, float, float, float]], 
+                     frame_height: int) -> str:
+        """
+        Detecta escala do track baseado em bbox_height / frame_height.
+        
+        Thresholds (alinhado com detector.py):
+        - NEAR: ratio > 0.45
+        - MID: ratio > 0.20
+        - FAR: ratio > 0.10
+        - DESC: ratio <= 0.10
+        
+        Parâmetros
+        ----------
+        bbox : tuple | None
+            (x1, y1, x2, y2)
+        frame_height : int
+            Altura do frame
+        
+        Retorna
+        -------
+        scale : str
+            "NEAR", "MID", "FAR", "DESC"
+        """
+        if bbox is None:
+            return "MID"  # default neutro
+        
+        x1, y1, x2, y2 = bbox
+        bbox_height = y2 - y1
+        ratio = bbox_height / max(frame_height, 1)
+        
+        # ============================================================
+        # CLASSIFICAÇÃO (mesmo threshold do detector)
+        # ============================================================
+        if ratio > 0.45:
+            return "NEAR"
+        elif ratio > 0.20:
+            return "MID"
+        elif ratio > 0.10:
+            return "FAR"
+        else:
+            return "DESC"
 
     # =========================================================================
     # MFSS + APPT (usando top-2 reais)
@@ -629,13 +733,20 @@ class ReIdentifier:
         """
         if self.bank.size() == 0:
             return 0.0, 0.0
-        emb = _l2_norm(embedding).view(1, -1)
+        
+        # ============================================================
+        # EMBEDDING JÁ NORMALIZADO (OSNet faz isso)
+        # ============================================================
+        emb = embedding.detach().cpu().view(1, -1)  # (1, 512)
+        
         sims = []
         for pid, identity in self.bank.identities.items():
             sim = float(torch.matmul(emb, identity.embedding.view(1, -1).T).item())
             sims.append(sim)
+        
         if not sims:
             return 0.0, 0.0
+        
         sims_sorted = sorted(sims, reverse=True)
         sim1 = sims_sorted[0]
         sim2 = sims_sorted[1] if len(sims_sorted) > 1 else 0.0
@@ -692,7 +803,7 @@ class ReIdentifier:
           • Δt < 2s E dist_norm > 0.35H E sim < 0.78
         """
         if bbox is None or pid not in self._last_position:
-            # Sem referência de posição — aceita
+            # Sem referência de posição – aceita
             print(f"{LOG_PREFIX_TEL} pid=P{pid:02d} dist=?H ok=YES (no_ref)")
             return True
 
@@ -754,7 +865,7 @@ class ReIdentifier:
         return penalty
 
     # =========================================================================
-    # EMA UPDATE (guardado) — mantém assinatura idêntica
+    # EMA UPDATE (guardado) – mantém assinatura idêntica
     # =========================================================================
     def update_prototype(self,
                          pid: int,
@@ -765,52 +876,85 @@ class ReIdentifier:
                          hsv_mean: np.ndarray,
                          frame_index: int) -> bool:
         """
-        Atualiza protótipo do PID com guards:
+        Atualiza protótipo do PID com guards SCALE-AWARE:
 
           • lock countdown == 0
-          • sim ≥ thr_in_pid + 0.05
+          • sim ≥ thr_in_pid + 0.05 (comparado contra protótipo da ESCALA CORRETA)
           • ΔHSV ≤ 12 (placeholder)
           • sem conflito com outro PID (placeholder)
 
-        Em seguida, aplica update no banco (EMA adaptativo no IdentityBank.update()).
+        Em seguida, aplica update no banco com EMA por escala (IdentityBank.update_prototype()).
         """
-        # GUARD 1 — lock
+        identity = self.bank.get(pid)
+        if identity is None:
+            return False
+        
+        # GUARD 1 – lock
         lock = self._lock_countdown.get(pid, 0)
         if lock > 0:
             self._lock_countdown[pid] = lock - 1
             print(f"[EMA_UPD] pid=P{pid:02d} scale={scale} sim={similarity:.2f} guards_ok=NO (lock={lock})")
             return False
 
-        # GUARD 2 — similaridade mínima
+        # GUARD 2 – similaridade mínima contra PROTÓTIPO DA ESCALA (PROBLEMA B RESOLVIDO)
+        # Se a escala tem protótipo, valida contra aquele. Senão, usa threshold base.
+        if scale in identity.prototypes:
+            # Recomputa sim contra protótipo da escala para validação mais precisa
+            proto_scale = identity.prototypes[scale]
+            emb = embedding.detach().cpu().view(1, -1)
+            similarity_scale = float(torch.matmul(emb, proto_scale.view(1, -1).T).item())
+        else:
+            # Primeira vez vendo essa escala, usa baseline
+            similarity_scale = similarity
+        
         thr_in_pid = self._compute_adaptive_threshold(pid)
         sim_min = thr_in_pid + EMA_SIM_MIN_OFFSET
-        if similarity < sim_min:
-            print(f"[EMA_UPD] pid=P{pid:02d} scale={scale} sim={similarity:.2f} guards_ok=NO (sim<{sim_min:.2f})")
+        if similarity_scale < sim_min:
+            print(f"[EMA_UPD] pid=P{pid:02d} scale={scale} sim={similarity_scale:.2f} guards_ok=NO (sim<{sim_min:.2f})")
             return False
 
-        # GUARD 3 — ΔHSV (placeholder: aceita)
-        # GUARD 4 — Oclusão (placeholder: aceita)
-        # GUARD 5 — Conflito (placeholder: aceita)
+        # GUARD 3 – ΔHSV (placeholder: aceita)
+        # GUARD 4 – Oclusão (placeholder: aceita)
+        # GUARD 5 – Conflito (placeholder: aceita)
 
-        # α adaptativo por health (IdentityBank.update já ajusta, mas mantemos log)
+        # α adaptativo por health
         health = self.bank.get_health(pid) or 1.0
         alpha = max(EMA_ALPHA_MIN, min(EMA_ALPHA_MAX, 0.10 - 0.05 * health))
 
-        # Atualiza embedding principal (EMA dentro do banco)
+        # Atualiza embedding principal (EMA no embedding geral) + protótipo por escala
         self.bank.update(pid, embedding, frame_index)
+        self.bank.update_prototype(pid, scale, embedding, alpha)
 
-        print(f"[EMA_UPD] pid=P{pid:02d} scale={scale} sim={similarity:.2f} α={alpha:.2f} guards_ok=YES")
+        print(f"[EMA_UPD] pid=P{pid:02d} scale={scale} sim={similarity_scale:.2f} α={alpha:.2f} guards_ok=YES")
         return True
 
     # =========================================================================
     # SINCRONIZAÇÃO BANCO ← GALLERY (quando já promovido)
     # =========================================================================
     def _update_bank_from_gallery(self, track_id: int, id_global: int, frame_index: int) -> None:
+        """
+        Consolida embeddings multi-escala da gallery → IdentityBank (PROBLEMA C RESOLVIDO).
+        
+        Estratégia: se há protótipos por escala, atualiza cada um individualmente.
+        Senão, usa embedding médio (fallback).
+        """
         if not self.gallery.exists(track_id):
             return
-        consolidated_emb = self.gallery.get(track_id)
-        if consolidated_emb is not None:
-            self.bank.update(id_global, consolidated_emb, frame_index)
+        
+        # Tenta consolidar com protótipos multi-escala
+        prototypes_multi = self.gallery.get_prototypes(track_id)
+        
+        if prototypes_multi:
+            # Consolida cada escala separadamente (scale-aware)
+            for scale, proto in prototypes_multi.items():
+                self.bank.update_prototype(id_global, scale, proto, alpha=0.15)
+            print(f"[BANK_CONS] tid=T{track_id} pid=P{id_global:02d} consolidated {len(prototypes_multi)} scales")
+        else:
+            # Fallback: embedding médio (compatibilidade)
+            consolidated_emb = self.gallery.get(track_id)
+            if consolidated_emb is not None:
+                self.bank.update(id_global, consolidated_emb, frame_index)
+                print(f"[BANK_CONS] tid=T{track_id} pid=P{id_global:02d} consolidated via avg (no protos)")
 
     # =========================================================================
     # QUERIES (públicos)
@@ -869,6 +1013,47 @@ class ReIdentifier:
         self._negate_timestamp.clear()
         self._last_position.clear()
         self._last_pos_time.clear()
+
+    def reset_dynamic_cache(self) -> None:
+        """
+        Reseta apenas caches dinâmicos entre loops de vídeo.
+        Mantém banco de identidades intacto (para Re-ID em novo loop).
+        
+        DEVE ser chamado em stream.py quando novo loop começa.
+        Evita que histerese e penalidades velhas contaminem novo loop.
+        
+        ============================================================
+        IMPORTANTE: O que é resetado vs preservado
+        ============================================================
+        RESETADO (porque depende de track_id que muda a cada loop):
+        - _track_to_global: mapeamento track_id → id_global (novo loop = novos track_ids)
+        - _track_colors: cores temporárias de tracking
+        - gallery: buffer temporal de embeddings (está associado a track_id ativo)
+        - Todos os caches dinâmicos (MFSS, K-window, NEGATE, posição, etc)
+        
+        PRESERVADO (identidades globais consolidadas - válidas entre loops):
+        - IdentityBank (self.bank): contém pessoas já identificadas com protótipos
+          └─ Cada identidade: id_global, protótipos multi-escala, cor, health, TTL
+          └─ Estas NÃO expiram imediatamente - TTL até 5 minutos
+          └─ Permite Re-ID em novo loop: mesma pessoa = mesmo PID
+        
+        Fluxo esperado:
+        1. Loop 1: pessoa aparece → gallery coleta embeddings → track some → consolida no banco (PID=1)
+        2. Loop 2: pessoa reaparece → busca no banco → encontra PID=1 → reutiliza
+        3. Loop 5 minutos depois: se pessoa não reapareceu → TTL expira → remove do banco
+        """
+        self._mfss_cache.clear()                 # similaridade temporal (MFSS)
+        self._k_window.clear()                   # janela K (confirmações)
+        self._k_last_update.clear()              # timestamp última atualização K
+        self._lock_countdown.clear()             # countdown de lock adaptativo
+        self._negate_timestamp.clear()           # penalidades de erro (muito importante!)
+        self._last_position.clear()              # cache de posição para anti-teleport
+        self._last_pos_time.clear()              # timestamp última posição
+        self._track_to_global.clear()            # mapping track → id_global (NOVO cada loop)
+        self._track_colors.clear()               # colors temporárias de tracking (NOVO cada loop)
+        self.gallery.clear_all()                 # gallery = buffer TEMPORÁRIO (depende de track_id)
+        bank_size = self.bank.size()
+        print(f"{LOG_PREFIX_BANKSYNC} Dynamic cache resetado para novo loop (banco com {bank_size} identidades preservadas)")
 
     # =========================================================================
     # UTILITÁRIOS

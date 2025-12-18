@@ -15,8 +15,17 @@ Formato de saída: [x1, y1, x2, y2, conf, cls, keypoints, scale, had_pad]
 import threading
 import time
 import cv2
+import queue
 import numpy as np
 from ultralytics import YOLO
+
+# ============================================================
+# FILAS DE COMUNICAÇÃO (Thread-Safe)
+# ============================================================
+# input_queue: (frame, frame_index)
+# result_queue: (detections, frame_index)
+input_queue = queue.Queue(maxsize=2)
+result_queue = queue.Queue(maxsize=2)
 
 latest_frame = None
 latest_detections = []
@@ -44,17 +53,45 @@ DET_LOW_THR = 0.20
 # ============================================================
 _scale_cache = {}  # bbox_id -> escala anterior
 
+def submit_frame(frame, frame_index):
+    """
+    Envia frame para fila de processamento (não bloqueante se cheio).
+    Substitui o antigo set_frame.
+    """
+    if not running:
+        return
 
-def set_frame(frame):
-    global latest_frame
-    with lock_frame:
-        latest_frame = frame.copy()
+    # Tenta colocar na fila; se cheia, descarta o frame antigo para manter realtime
+    try:
+        input_queue.put_nowait((frame.copy(), frame_index))
+    except queue.Full:
+        # Opcional: Dropar frame antigo e colocar o novo, ou apenas ignorar o novo
+        pass
 
 
-def get_detections():
-    with lock_det:
-        return list(latest_detections)
+def reset_detector_state():
+    """
+    Reseta estado global do detector entre loops de vídeo.
+    DEVE ser chamado em stream.py quando novo loop começa (no start_stream).
+    """
+    global _scale_cache
+    _scale_cache.clear()
+    print("[DETECTOR_RESET] _scale_cache limpo")
 
+
+def get_result():
+    """
+    Recupera resultado do detector (se disponível).
+    
+    Retorna
+    -------
+    tuple ou None
+        (detections, frame_index)
+    """
+    try:
+        return result_queue.get_nowait()
+    except queue.Empty:
+        return None
 
 def person_is_valid(keypoints):
     """
@@ -186,13 +223,10 @@ def detector_thread():
     frame_count = 0
 
     while running:
-        frame = None
-        with lock_frame:
-            if latest_frame is not None:
-                frame = latest_frame.copy()
-
-        if frame is None:
-            time.sleep(0.001)
+        try:
+            # Bloqueia esperando frame (timeout permite checar running)
+            frame, frame_index = input_queue.get(timeout=0.1)
+        except queue.Empty:
             continue
 
         frame_h, frame_w = frame.shape[:2]
@@ -200,7 +234,10 @@ def detector_thread():
         # ============================================================
         # YOLO DETECÇÃO
         # ============================================================
+        t0_yolo = time.perf_counter()
         results = model(frame, verbose=False)
+        t1_yolo = time.perf_counter()
+        yolo_ms = (t1_yolo - t0_yolo) * 1000.0
         dets = []
         
         scales_count = {"NEAR": 0, "MID": 0, "FAR": 0, "DESC": 0}
@@ -270,10 +307,13 @@ def detector_thread():
                 ])
 
         # ============================================================
-        # ATUALIZA DETECÇÕES COMPARTILHADAS
+        # ENVIA RESULTADO (Detecções + Frame Index Original)
         # ============================================================
-        with lock_det:
-            latest_detections = dets
+        if running:
+            try:
+                result_queue.put((dets, frame_index), timeout=0.1)
+            except queue.Full:
+                pass
 
         # ============================================================
         # LOG: [DET] resumo do frame
@@ -281,6 +321,7 @@ def detector_thread():
         if frame_count % 30 == 0 or len(dets) > 0:  # log a cada 30 frames ou quando há detecções
             n_total = len(dets)
             print(f"[DET] f={frame_count} n={n_total} | high={n_high} | scales: N={scales_count['NEAR']} M={scales_count['MID']} F={scales_count['FAR']} D={scales_count['DESC']}")
+            print(f"[YOLO_TIME] f={frame_count} time={yolo_ms:.1f}ms")
         
         frame_count += 1
         

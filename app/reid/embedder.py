@@ -1,5 +1,5 @@
 """
-Embedder Thread — Pipeline assíncrono de Re-ID com gate de qualidade
+Embedder Thread – Pipeline assíncrono de Re-ID com gate de qualidade
 
 Responsabilidades:
 - Consumir tracks ativos do ByteTracker (ACTIVE + PENDING)
@@ -23,7 +23,6 @@ from typing import Dict, Set, Optional, Any, List
 from collections import deque
 
 import torch
-import torch.nn.functional as F
 
 from .cropper import crop_body
 from app.osnet.osnet_model import OsNetEmbedder
@@ -33,8 +32,8 @@ from .reidentifier import ReIdentifier
 # ============================================================
 # GATE DE QUALIDADE - THRESHOLDS
 # ============================================================
-GATE_CONF_MIN = 0.50        # confiança YOLO mínima
-GATE_COVERAGE_MIN = 0.55    # cobertura do crop (0.90 se NEAR)
+GATE_CONF_MIN = 0.55        # confiança YOLO mínima
+GATE_COVERAGE_MIN = 0.85    # cobertura do crop (bbox visível dentro do frame)
 GATE_BLUR_MIN = 20.0        # Laplacian variance mínima
 GATE_SCALE_REJECT = "DESC"  # rejeita escala DESCARTÁVEL
 
@@ -49,7 +48,7 @@ class ReIDEmbedderThread:
     Thread assíncrona de Re-ID com gate de qualidade.
     
     Consome tracks ativos + detecções (bbox + keypoints + metadata) do pipeline principal.
-    Não bloqueia FPS — processa de forma assíncrona.
+    Não bloqueia FPS – processa de forma assíncrona.
     """
 
     def __init__(self,
@@ -130,7 +129,7 @@ class ReIDEmbedderThread:
     # =========================================================================
 
     def _loop(self):
-        """Loop principal da thread — processa tracks assincronamente"""
+        """Loop principal da thread – processa tracks assincronamente"""
         while self.running:
             time.sleep(self.sleep_ms / 1000.0)
 
@@ -139,7 +138,7 @@ class ReIDEmbedderThread:
             # ============================================================
             with self.lock_frame:
                 frame: Optional[np.ndarray] = self.shared_frame.get('frame')
-                frame_index: int = self.shared_frame.get('frame_index', 0)
+                frame_index: int = self.shared_frame.get('frame_index', -1)
 
             if frame is None:
                 continue
@@ -154,9 +153,23 @@ class ReIDEmbedderThread:
                 temp_lost_tracks: List[dict] = self.shared_tracks.get('temp_lost', [])
                 density: float = self.shared_tracks.get('density', 0.0)
                 frame_height: int = self.shared_tracks.get('frame_height', 1080)
+                tracks_frame_index: int = self.shared_tracks.get('frame_index', -1)
+
+            # ============================================================
+            # VALIDAÇÃO OBRIGATÓRIA #2: Mutual check frame_index
+            # Se desincronizados, frame pode estar errado – skip ciclo
+            # ============================================================
+            if frame_index != tracks_frame_index:
+                print(f"[EMBEDDER_DESYNC] Frame={frame_index} Tracks={tracks_frame_index} "
+                      f"(misaligned) - skipping cycle")
+                continue
+
+            if frame_index < 0:
+                # Frame index ainda não inicializado
+                continue
 
             if not tracks:
-                # Sem tracks ativos — atualiza cache e continua
+                # Sem tracks ativos – atualiza cache e continua
                 self._tracks_temp_lost_last_frame = set()
                 continue
 
@@ -202,21 +215,24 @@ class ReIDEmbedderThread:
                             identity = self.reid.bank.get(pid)
                             
                             if emb is not None and identity is not None:
+                                # ============================================================
+                                # EMBEDDINGS JÁ NORMALIZADOS (OSNet faz isso)
+                                # ============================================================
                                 sim = float(torch.matmul(
-                                    F.normalize(emb, p=2, dim=0).view(1, -1),
+                                    emb.view(1, -1),
                                     identity.embedding.view(1, -1).T
                                 ).item())
                                 
                                 # INCONSISTÊNCIA GRAVE (troca de ID detectada)
                                 if sim < 0.40:
                                     print(f"[EMB_REFIND] f={frame_index} tid=T{track_id} pid=P{pid:02d} sim={sim:.2f} INCONSISTENT → force_reid")
-                                    # Não skip — permite Re-ID para corrigir
+                                    # Não skip – permite Re-ID para corrigir
                                 else:
-                                    # Consistente — skip on_new_track (refind legítimo)
+                                    # Consistente – skip on_new_track (refind legítimo)
                                     print(f"[EMB_REFIND] f={frame_index} tid=T{track_id} pid=P{pid:02d} sim={sim:.2f} skip=YES (refind)")
                                     continue
                     else:
-                        # Não promovido ainda — skip on_new_track (refind)
+                        # Não promovido ainda – skip on_new_track (refind)
                         print(f"[EMB_REFIND] f={frame_index} tid=T{track_id} skip=YES (refind)")
                         continue
 
@@ -227,7 +243,8 @@ class ReIDEmbedderThread:
                     conf=conf,
                     scale=scale,
                     bbox=bbox,
-                    frame_shape=(frame_h, frame_w)
+                    frame_shape=(frame_h, frame_w),
+                    frame_index=frame_index  # NOVO: validar frame_index
                 )
 
                 if not gate_pass:
@@ -247,7 +264,7 @@ class ReIDEmbedderThread:
                 # VALIDAÇÃO: cobertura do crop
                 # ============================================================
                 coverage = self._compute_coverage(bbox, (frame_h, frame_w))
-                coverage_min = 0.90 if scale == "NEAR" else GATE_COVERAGE_MIN
+                coverage_min = 0.85 if scale == "NEAR" else GATE_COVERAGE_MIN
                 
                 if coverage < coverage_min:
                     print(f"[EMB_GATE] f={frame_index} tid=T{track_id} pass=NO reason=low_coverage coverage={coverage:.2f}")
@@ -281,30 +298,14 @@ class ReIDEmbedderThread:
                 # ============================================================
                 # OSNET EMBEDDING EXTRACTION
                 # ============================================================
-                
-                preview = crop.copy()
-                cv2.putText(preview, "a", (10, 20),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-                cv2.imshow("BBox Preview", preview)
-
-                key = cv2.waitKey(1)
-                if key == 27:  # ESC fecha a janela
-                    cv2.destroyWindow("BBox Preview")
-                    
                 emb = self.osnet.extract_one(crop)
                 if emb is None:
                     continue
 
                 # ============================================================
-                # TEST 1: OSNet cru vs Banco
+                # EMBEDDING JÁ NORMALIZADO (OSNet faz isso)
+                # Não re-normalizar aqui
                 # ============================================================
-                if self.reid.is_promoted(track_id):
-                    pid = self.reid.get_global_id(track_id)
-                    if pid is not None:
-                        identity = self.reid.bank.get(pid)
-                        if identity is not None:
-                            sim_raw = torch.matmul(emb.view(1,-1), identity.embedding.view(1,-1).T).item()
-                            print(f"[TEST_RAW] tid=T{track_id} pid=P{pid:02d} sim_raw={sim_raw:.3f}")
 
                 # ============================================================
                 # BUFFER: adiciona com stride temporal
@@ -322,15 +323,6 @@ class ReIDEmbedderThread:
                 if added:
                     size = self.gallery.count(track_id)
                     print(f"[BUF_ADD] f={frame_index} tid=T{track_id} size={size}/10 scale={scale} blur_z={blur_z:+.1f} stride_ok=YES")
-                    
-                    # ============================================================
-                    # TEST 2: OSNet cru vs Gallery consolidado
-                    # ============================================================
-                    if size >= 2:
-                        emb_cons = self.gallery.get(track_id)
-                        if emb_cons is not None:
-                            sim_cons = torch.matmul(emb.view(1,-1), emb_cons.view(1,-1).T).item()
-                            print(f"[TEST_CONS] tid=T{track_id} sim_raw_vs_cons={sim_cons:.3f} count={size}")
                 else:
                     # Rejeitado por stride
                     pass
@@ -341,10 +333,16 @@ class ReIDEmbedderThread:
                 # - Se track novo: tenta Re-ID após min_samples
                 # ============================================================
                 if self.reid.is_promoted(track_id):
-                    # Track já tem id_global — apenas atualiza Gallery
-                    self.reid.on_track_active(track_id, emb, frame_index)
+                    # Track já tem id_global – apenas atualiza Gallery (com scale-aware EMA)
+                    self.reid.on_track_active(
+                        track_id=track_id,
+                        embedding=emb,
+                        frame_index=frame_index,
+                        bbox=bbox,
+                        frame_height=frame_height
+                    )
                 else:
-                    # Track novo — tenta Re-ID (propaga bbox/density/frame_height)
+                    # Track novo – tenta Re-ID (propaga bbox/density/frame_height)
                     id_global = self.reid.on_new_track(
                         track_id=track_id,
                         embedding=emb,
@@ -370,14 +368,21 @@ class ReIDEmbedderThread:
                       conf: float,
                       scale: str,
                       bbox: tuple,
-                      frame_shape: tuple) -> tuple:
+                      frame_shape: tuple,
+                      frame_index: int = -1) -> tuple:
         """
         Gate de qualidade multi-critério.
         
         Critérios:
-        1. conf_yolo ≥ 0.50
-        2. scale ≠ DESC
-        3. bbox dentro do frame (não cortada demais)
+        1. frame_index válido (sincronização)
+        2. conf_yolo ≥ 0.50
+        3. scale ≠ DESC
+        4. bbox dentro do frame (não cortada demais)
+        
+        Parâmetros
+        ----------
+        frame_index : int
+            Frame index para validação de sincronização
         
         Retorna
         -------
@@ -386,6 +391,12 @@ class ReIDEmbedderThread:
         reason : str
             Motivo de rejeição (se fail)
         """
+        # ============================================================
+        # CRITÉRIO 0: frame_index válido (sincronização)
+        # ============================================================
+        if frame_index < 0:
+            return False, "invalid_frame_index"
+        
         # ============================================================
         # CRITÉRIO 1: confiança YOLO
         # ============================================================
@@ -405,7 +416,6 @@ class ReIDEmbedderThread:
         
         return True, "ok"
 
-    # embedder.py
     def _compute_coverage(self, bbox: tuple, frame_shape: tuple) -> float:
         """
         Cobertura = fração da ALTURA da bbox que está dentro do frame (0..1).

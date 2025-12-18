@@ -18,10 +18,9 @@ data/
 *.env
 .DS_Store
 .idea/
-.vscode/
 app/tracker/bytetrack/cython_bbox.c
 app/tracker/bytetrack/cython_bbox.egg-info/
 app/tracker/bytetrack/cython_bbox.egg-info/top_level.txt
 app/tracker/bytetrack/cython_bbox.egg-info/SOURCES.txt
 app/tracker/bytetrack/cython_bbox.egg-info/dependency_links.txt
-app/tracker/bytetrack/cython_bbox.c
+app/tracker/bytetrack/cython_bbox.cpython-310-x86_64-linux-gnu.so
