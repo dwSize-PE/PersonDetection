@@ -231,6 +231,18 @@ Press `ESC` to exit.
   osnet = OsNetEmbedder(device="cpu")  # Force CPU usage
   ```
 
+## Acknowledgments
+
+We would like to express our gratitude to the following projects and authors whose work was utilized and extended in this system:
+
+- **YOLO (Ultralytics)**  
+  The object detection in this project is powered by **YOLOv11-pose**, developed and maintained by the **Ultralytics** team.  
+  GitHub Repository: [https://github.com/ultralytics/ultralytics](https://github.com/ultralytics/ultralytics)
+
+- **ByteTrack**  
+  The tracking system is implemented using the **ByteTrack** library, which utilizes Kalman filters to track multiple objects and handle occlusions. This project has been enhanced with custom improvements to better suit our specific use case.  
+  GitHub Repository: [https://github.com/FoundationVision/ByteTrack](https://github.com/FoundationVision/ByteTrack)
+
 ## License
 
 This project is licensed under the **Educational and Non-Commercial Use License**. For more details, please refer to the [LICENSE.TXT](LICENSE.TXT) file.
