@@ -234,5 +234,3 @@ Press `ESC` to exit.
 ## License
 
 This project is licensed under the **Educational and Non-Commercial Use License**. For more details, please refer to the [LICENSE.TXT](LICENSE.TXT) file.
-
-If you wish to use this software for commercial purposes, please contact the author at [souzaleonardomelo1@gmail.com](mailto:souzaleonardomelo1@gmail.com) to discuss the commercial licensing terms.
