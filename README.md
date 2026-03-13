@@ -20,6 +20,8 @@ Here's what makes it special:
 * Event monitoring and crowd management
 * Any scenario where you need to track people over time
 
+https://github.com/user-attachments/assets/d310d657-c42c-4077-9bb8-4401d2ee27cd
+
 ## ✨ Key Features
 
 ### 🔍 Smart Detection & Tracking
@@ -37,7 +39,9 @@ Here's what makes it special:
   * How long they were visible
   * Detection confidence
   * Quality of their appearance
-  * How many times they reappeared
+  * How 
+
+many times they reappeared
 * **Multi-Scale Prototypes**: separate embeddings for near/mid/far distances
 * **Hungarian Matching** considers similarity, time, space, and quality
 
